@@ -3,6 +3,7 @@
  */
 import { Router } from 'express';
 import { calculateRiskScore } from '../services/riskEngine.js';
+import { calculateArcScore } from '../services/arcScore.js';
 import { getSanctionsReport, isSanctioned } from '../services/sanctionsCheck.js';
 import { getWalletInfo, getRecentTransactions } from '../services/arcProvider.js';
 import { ethers } from 'ethers';
@@ -67,6 +68,27 @@ router.get('/wallet/:address', async (req, res) => {
     res.json(info);
   } catch (err) {
     console.error('[API] wallet error:', err);
+    res.status(500).json({ error: 'Internal server error', message: err.message });
+  }
+});
+
+/**
+ * GET /api/v1/arc-score/:address
+ * Arc-native reputation score based on onchain activity
+ */
+router.get('/arc-score/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+
+    if (!ethers.isAddress(address)) {
+      return res.status(400).json({ error: 'Invalid Ethereum address' });
+    }
+
+    const checksumAddress = ethers.getAddress(address);
+    const result = await calculateArcScore(checksumAddress);
+    res.json(result);
+  } catch (err) {
+    console.error('[API] arc-score error:', err);
     res.status(500).json({ error: 'Internal server error', message: err.message });
   }
 });
