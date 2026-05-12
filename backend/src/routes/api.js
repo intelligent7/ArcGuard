@@ -85,6 +85,7 @@ router.post('/screen', async (req, res) => {
       return res.status(400).json({ error: 'Invalid sender address' });
     }
 
+    const txAmount = Number(amount) || 0;
     const checksumAddress = ethers.getAddress(sender);
 
     // Quick sanctions check first (fast path)
@@ -92,9 +93,10 @@ router.post('/screen', async (req, res) => {
       return res.json({
         decision: 'reject',
         reason: 'Sanctioned address (OFAC)',
+        action: 'BLOCK — Do not process. Freeze if possible.',
         score: 100,
         sender: checksumAddress,
-        amount,
+        amount: txAmount,
         timestamp: new Date().toISOString(),
       });
     }
@@ -102,18 +104,29 @@ router.post('/screen', async (req, res) => {
     // Full risk assessment
     const result = await calculateRiskScore(checksumAddress);
 
-    let decision;
-    if (result.score <= 30) decision = 'accept';
-    else if (result.score <= 60) decision = 'review';
-    else decision = 'reject';
+    // ══════════════════════════════════════════════════
+    //  Decision Matrix: Score × Transaction Amount
+    //  (adapted from SEON/Kount antifraud methodology)
+    // ══════════════════════════════════════════════════
+    //
+    //  |               | Score 0-30  | Score 31-60  | Score 61-100  |
+    //  |---------------|------------|-------------|--------------|
+    //  | Small (<$100) | Accept     | Accept+Flag | Review       |
+    //  | Mid ($100-10K)| Accept     | Review      | Reject       |
+    //  | Large (>$10K) | Accept+Log | Reject+Alert| Reject+Freeze|
+
+    const decision = getDecision(result.score, txAmount);
 
     res.json({
-      decision,
+      decision: decision.action,
       reason: result.verdict,
+      recommendation: decision.recommendation,
       score: result.score,
       level: result.level,
+      entityType: result.entityType,
       sender: checksumAddress,
-      amount,
+      amount: txAmount,
+      amountTier: decision.amountTier,
       checks: result.checks,
       timestamp: new Date().toISOString(),
       processingTimeMs: result.processingTimeMs,
@@ -123,6 +136,41 @@ router.post('/screen', async (req, res) => {
     res.status(500).json({ error: 'Internal server error', message: err.message });
   }
 });
+
+/**
+ * Decision matrix: Score × Amount → action + recommendation
+ */
+function getDecision(score, amount) {
+  const amountTier = amount > 10000 ? 'large' : amount > 100 ? 'medium' : 'small';
+
+  if (score <= 30) {
+    // Low risk
+    if (amountTier === 'large') {
+      return { action: 'accept', amountTier, recommendation: 'Accept — log transaction for audit trail' };
+    }
+    return { action: 'accept', amountTier, recommendation: 'Accept — no action needed' };
+  }
+
+  if (score <= 60) {
+    // Medium risk
+    if (amountTier === 'small') {
+      return { action: 'accept', amountTier, recommendation: 'Accept — flag address for monitoring' };
+    }
+    if (amountTier === 'medium') {
+      return { action: 'review', amountTier, recommendation: 'Manual review recommended before processing' };
+    }
+    return { action: 'reject', amountTier, recommendation: 'Reject — medium risk + large amount. Request source of funds.' };
+  }
+
+  // High risk (61-100)
+  if (amountTier === 'small') {
+    return { action: 'review', amountTier, recommendation: 'Review — high risk but small amount. Monitor closely.' };
+  }
+  if (amountTier === 'medium') {
+    return { action: 'reject', amountTier, recommendation: 'Reject — do not process. Consider quarantine.' };
+  }
+  return { action: 'reject', amountTier, recommendation: 'REJECT + FREEZE — high risk, large amount. Quarantine funds immediately.' };
+}
 
 /**
  * POST /api/v1/batch-check
