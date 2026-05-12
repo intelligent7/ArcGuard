@@ -427,7 +427,7 @@ function EventRow({ event }) {
         </div>
       </div>
       <div className="event-side">
-        <div className="event-amount">{formatTokenAmount(event.amountUnits, event.amountLabel)}</div>
+        <div className="event-amount">{formatTokenAmount(event.amount, event.amountLabel)}</div>
         <div className="event-addresses">
           {event.addresses?.from && <span>from {shortAddress(event.addresses.from)}</span>}
           {event.addresses?.to && <span>to {shortAddress(event.addresses.to)}</span>}
@@ -539,6 +539,10 @@ function formatNumber(value) {
 }
 
 function formatTokenAmount(value, label = 'units') {
+  if (value === null || value === undefined) {
+    return '-';
+  }
+
   const number = Number(value) || 0;
   if (number === 0) {
     return `0 ${label}`;

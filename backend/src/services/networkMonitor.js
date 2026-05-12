@@ -2,6 +2,11 @@ import { ethers } from 'ethers';
 import { getBlock, getLatestBlock, getProvider } from './arcProvider.js';
 
 const TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
+const ERC20_METADATA_ABI = [
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
+  'function name() view returns (string)',
+];
 
 const DEFAULT_INTERVAL_MS = 5000;
 const BACKFILL_BLOCKS = 20;
@@ -9,11 +14,12 @@ const MAX_BLOCKS_PER_POLL = 60;
 const LIVE_WINDOW_BLOCKS = 90;
 const MAX_EVENTS = 250;
 
-const WHALE_TRANSFER_UNITS = 10000;
-const MASSIVE_OUTFLOW_UNITS = 50000;
+const WHALE_TRANSFER_AMOUNT = 10000;
+const MASSIVE_OUTFLOW_AMOUNT = 50000;
 const BURST_TRANSFER_COUNT = 25;
 const CCTP_SPIKE_COUNT = 35;
-const CCTP_SPIKE_VOLUME_UNITS = 100000;
+const CCTP_SPIKE_VOLUME_AMOUNT = 100000;
+const STABLE_TOKEN_SYMBOLS = new Set(['USDC', 'WUSDC', 'EURC']);
 
 const state = {
   running: false,
@@ -35,6 +41,7 @@ const state = {
 let intervalId = null;
 let polling = false;
 const knownEventIds = new Set();
+const tokenMetadataCache = new Map();
 
 export async function startNetworkMonitor(options = {}) {
   if (state.running) {
@@ -154,7 +161,7 @@ async function inspectBlock(blockNumber) {
     getTransferLogs(blockNumber),
   ]);
 
-  const transfers = logs.map(parseTransferLog).filter(Boolean);
+  const transfers = (await Promise.all(logs.map(parseTransferLog))).filter(Boolean);
   state.stats.blocksScanned += 1;
   state.stats.transfersSeen += transfers.length;
 
@@ -179,7 +186,7 @@ async function getTransferLogs(blockNumber) {
   });
 }
 
-function parseTransferLog(log) {
+async function parseTransferLog(log) {
   if (!log.topics || log.topics.length < 3 || !log.data) {
     return null;
   }
@@ -187,15 +194,22 @@ function parseTransferLog(log) {
   try {
     const from = ethers.getAddress(`0x${log.topics[1].slice(26)}`);
     const to = ethers.getAddress(`0x${log.topics[2].slice(26)}`);
-    const valueUnits = Number(ethers.formatUnits(BigInt(log.data), 6));
+    const contractAddress = ethers.getAddress(log.address);
+    const metadata = await getTokenMetadata(contractAddress);
+    const rawAmount = BigInt(log.data);
+    const amount = Number(ethers.formatUnits(rawAmount, metadata.decimals));
 
     return {
       from,
       to,
-      valueUnits,
+      amount,
+      rawAmount: rawAmount.toString(),
+      tokenSymbol: metadata.symbol,
+      tokenName: metadata.name,
+      tokenDecimals: metadata.decimals,
       blockNumber: log.blockNumber,
       txHash: log.transactionHash,
-      contractAddress: ethers.getAddress(log.address),
+      contractAddress,
       logIndex: log.index,
     };
   } catch {
@@ -203,56 +217,106 @@ function parseTransferLog(log) {
   }
 }
 
+async function getTokenMetadata(address) {
+  const cacheKey = address.toLowerCase();
+  if (tokenMetadataCache.has(cacheKey)) {
+    return tokenMetadataCache.get(cacheKey);
+  }
+
+  const provider = getProvider();
+  const token = new ethers.Contract(address, ERC20_METADATA_ABI, provider);
+  const metadata = {
+    symbol: 'TOKEN',
+    name: 'Unknown token',
+    decimals: 18,
+  };
+
+  try {
+    metadata.decimals = Number(await token.decimals());
+  } catch {
+    metadata.decimals = 18;
+  }
+
+  try {
+    metadata.symbol = sanitizeTokenText(await token.symbol(), 'TOKEN');
+  } catch {
+    metadata.symbol = 'TOKEN';
+  }
+
+  try {
+    metadata.name = sanitizeTokenText(await token.name(), 'Unknown token');
+  } catch {
+    metadata.name = 'Unknown token';
+  }
+
+  tokenMetadataCache.set(cacheKey, metadata);
+  return metadata;
+}
+
 function detectWhaleTransfers(transfers, block) {
   return transfers
     .filter((transfer) => !isZeroAddress(transfer.from) && !isZeroAddress(transfer.to))
-    .filter((transfer) => transfer.valueUnits >= WHALE_TRANSFER_UNITS)
+    .filter(isStableTokenTransfer)
+    .filter((transfer) => transfer.amount >= WHALE_TRANSFER_AMOUNT)
     .slice(0, 20)
     .map((transfer) => buildEvent({
       type: 'whale_transfer',
-      severity: transfer.valueUnits >= MASSIVE_OUTFLOW_UNITS ? 'high' : 'medium',
-      title: 'Whale transfer',
-      summary: `${formatAmount(transfer.valueUnits)} token units moved in one transfer`,
+      severity: transfer.amount >= MASSIVE_OUTFLOW_AMOUNT ? 'high' : 'medium',
+      title: 'Whale stablecoin transfer',
+      summary: `${formatAmount(transfer.amount)} ${transfer.tokenSymbol} moved in one transfer`,
       block,
       txHash: transfer.txHash,
-      amountUnits: transfer.valueUnits,
+      amount: transfer.amount,
+      amountLabel: transfer.tokenSymbol,
       addresses: {
         from: transfer.from,
         to: transfer.to,
         token: transfer.contractAddress,
       },
       metrics: {
-        thresholdUnits: WHALE_TRANSFER_UNITS,
+        thresholdAmount: WHALE_TRANSFER_AMOUNT,
+        tokenDecimals: transfer.tokenDecimals,
+        tokenName: transfer.tokenName,
+        rawAmount: transfer.rawAmount,
       },
     }));
 }
 
 function detectMassiveOutflows(transfers, block) {
-  const spendTransfers = transfers.filter((transfer) => !isZeroAddress(transfer.from) && !isZeroAddress(transfer.to));
-  const bySender = groupBy(spendTransfers, (transfer) => transfer.from.toLowerCase());
+  const spendTransfers = transfers
+    .filter((transfer) => !isZeroAddress(transfer.from) && !isZeroAddress(transfer.to))
+    .filter(isStableTokenTransfer);
+  const bySenderAndToken = groupBy(
+    spendTransfers,
+    (transfer) => `${transfer.from.toLowerCase()}:${transfer.contractAddress.toLowerCase()}`
+  );
   const events = [];
 
-  for (const senderTransfers of bySender.values()) {
-    const total = senderTransfers.reduce((sum, transfer) => sum + transfer.valueUnits, 0);
+  for (const senderTransfers of bySenderAndToken.values()) {
+    const total = senderTransfers.reduce((sum, transfer) => sum + transfer.amount, 0);
     const uniqueRecipients = new Set(senderTransfers.map((transfer) => transfer.to.toLowerCase())).size;
+    const firstTransfer = senderTransfers[0];
 
-    if (total >= MASSIVE_OUTFLOW_UNITS && uniqueRecipients >= 2) {
+    if (total >= MASSIVE_OUTFLOW_AMOUNT && uniqueRecipients >= 2) {
       events.push(buildEvent({
         type: 'massive_outflow',
         severity: 'high',
         title: 'Massive outflow',
-        summary: `${formatAmount(total)} token units sent to ${uniqueRecipients} recipient(s) in one block`,
+        summary: `${formatAmount(total)} ${firstTransfer.tokenSymbol} sent to ${uniqueRecipients} recipient(s) in one block`,
         block,
-        txHash: senderTransfers[0].txHash,
-        amountUnits: total,
+        txHash: firstTransfer.txHash,
+        amount: total,
+        amountLabel: firstTransfer.tokenSymbol,
         addresses: {
-          from: senderTransfers[0].from,
-          token: senderTransfers[0].contractAddress,
+          from: firstTransfer.from,
+          token: firstTransfer.contractAddress,
         },
         metrics: {
           transferCount: senderTransfers.length,
           uniqueRecipients,
-          thresholdUnits: MASSIVE_OUTFLOW_UNITS,
+          thresholdAmount: MASSIVE_OUTFLOW_AMOUNT,
+          tokenDecimals: firstTransfer.tokenDecimals,
+          tokenName: firstTransfer.tokenName,
         },
       }));
     }
@@ -266,7 +330,6 @@ function detectBurstActivity(transfers, block) {
     return [];
   }
 
-  const total = transfers.reduce((sum, transfer) => sum + transfer.valueUnits, 0);
   const uniqueSenders = new Set(transfers.map((transfer) => transfer.from.toLowerCase())).size;
   const uniqueRecipients = new Set(transfers.map((transfer) => transfer.to.toLowerCase())).size;
 
@@ -278,7 +341,6 @@ function detectBurstActivity(transfers, block) {
       summary: `${transfers.length} transfer logs in block ${getBlockNumber(block)}`,
       block,
       txHash: transfers[0]?.txHash || null,
-      amountUnits: total,
       metrics: {
         transferCount: transfers.length,
         uniqueSenders,
@@ -289,37 +351,44 @@ function detectBurstActivity(transfers, block) {
 }
 
 function detectCctpSpikeCandidate(transfers, block) {
-  const spendTransfers = transfers.filter((transfer) => !isZeroAddress(transfer.from) && !isZeroAddress(transfer.to));
-  const total = spendTransfers.reduce((sum, transfer) => sum + transfer.valueUnits, 0);
-  if (spendTransfers.length < CCTP_SPIKE_COUNT || total < CCTP_SPIKE_VOLUME_UNITS) {
-    return [];
-  }
-
+  const spendTransfers = transfers
+    .filter((transfer) => !isZeroAddress(transfer.from) && !isZeroAddress(transfer.to))
+    .filter(isStableTokenTransfer);
   const byToken = groupBy(spendTransfers, (transfer) => transfer.contractAddress.toLowerCase());
   const [token, tokenTransfers] = [...byToken.entries()]
     .sort((a, b) => b[1].length - a[1].length)[0] || [null, []];
+  const total = tokenTransfers.reduce((sum, transfer) => sum + transfer.amount, 0);
+
+  if (tokenTransfers.length < CCTP_SPIKE_COUNT || total < CCTP_SPIKE_VOLUME_AMOUNT) {
+    return [];
+  }
+
+  const firstTransfer = tokenTransfers[0];
 
   return [
     buildEvent({
       type: 'cctp_spike_candidate',
       severity: 'high',
       title: 'CCTP spike candidate',
-      summary: `${formatAmount(total)} token-unit volume and ${spendTransfers.length} spend transfers in one block`,
+      summary: `${formatAmount(total)} ${firstTransfer.tokenSymbol} volume and ${tokenTransfers.length} spend transfers in one block`,
       block,
-      txHash: spendTransfers[0]?.txHash || null,
-      amountUnits: total,
+      txHash: firstTransfer.txHash,
+      amount: total,
+      amountLabel: firstTransfer.tokenSymbol,
       addresses: {
         token: token ? ethers.getAddress(token) : null,
       },
       metrics: {
-        transferCount: spendTransfers.length,
+        transferCount: tokenTransfers.length,
         dominantTokenTransfers: tokenTransfers.length,
+        tokenDecimals: firstTransfer.tokenDecimals,
+        tokenName: firstTransfer.tokenName,
       },
     }),
   ];
 }
 
-function buildEvent({ type, severity, title, summary, block, txHash, amountUnits = 0, addresses = {}, metrics = {} }) {
+function buildEvent({ type, severity, title, summary, block, txHash, amount = null, amountLabel = '', addresses = {}, metrics = {} }) {
   const blockNumber = getBlockNumber(block);
   return {
     id: `${type}:${blockNumber}:${txHash || 'block'}:${hashText(summary)}`,
@@ -331,8 +400,8 @@ function buildEvent({ type, severity, title, summary, block, txHash, amountUnits
     blockHash: block?.hash || null,
     timestamp: block?.timestamp ? new Date(block.timestamp * 1000).toISOString() : new Date().toISOString(),
     txHash,
-    amountUnits: round(amountUnits),
-    amountLabel: 'token units',
+    amount: amount === null ? null : round(amount),
+    amountLabel,
     addresses,
     metrics,
   };
@@ -375,8 +444,20 @@ function formatAmount(value) {
   return round(value).toLocaleString('en-US');
 }
 
+function sanitizeTokenText(value, fallback) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return fallback;
+  }
+  return text.slice(0, 32);
+}
+
 function isZeroAddress(address) {
   return String(address).toLowerCase() === ethers.ZeroAddress.toLowerCase();
+}
+
+function isStableTokenTransfer(transfer) {
+  return STABLE_TOKEN_SYMBOLS.has(String(transfer.tokenSymbol || '').toUpperCase());
 }
 
 function round(value, digits = 2) {

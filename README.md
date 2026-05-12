@@ -52,7 +52,7 @@ npm run dev
 | `GET` | `/api/v1/risk-score/:address` | Full risk assessment (0-100 score) |
 | `GET` | `/api/v1/arc-score/:address` | Arc-native wallet reputation score |
 | `GET` | `/api/v1/monitor/status` | Network Monitor polling status |
-| `GET` | `/api/v1/monitor/events` | Recent whale, outflow, burst, and spike events |
+| `GET` | `/api/v1/monitor/events` | Recent stablecoin whale/outflow events and transfer bursts |
 | `GET` | `/api/v1/sanctions/:address` | Quick OFAC sanctions check |
 | `GET` | `/api/v1/wallet/:address` | Basic wallet info |
 | `POST` | `/api/v1/screen` | Screen incoming payment (accept/reject/review) |
