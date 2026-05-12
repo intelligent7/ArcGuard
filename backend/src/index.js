@@ -5,6 +5,7 @@ import express from 'express';
 import cors from 'cors';
 import apiRoutes from './routes/api.js';
 import { loadSanctionsList } from './services/sanctionsCheck.js';
+import { startNetworkMonitor } from './services/networkMonitor.js';
 
 const app = express();
 const PORT = process.env.PORT || 3099;
@@ -34,6 +35,9 @@ app.get('/', (req, res) => {
       'GET  /api/v1/arc-score/:address   - Arc reputation score',
       'GET  /api/v1/sanctions/:address   - Quick sanctions check',
       'GET  /api/v1/wallet/:address      - Wallet info',
+      'GET  /api/v1/monitor/status       - Network Monitor status',
+      'GET  /api/v1/monitor/events       - Network Monitor live feed',
+      'POST /api/v1/monitor/poll         - Force one monitor poll',
       'POST /api/v1/screen               - Screen incoming payment',
       'POST /api/v1/batch-check          - Batch address screening',
       'GET  /api/v1/health               - Health check',
@@ -51,6 +55,9 @@ async function start() {
   console.log('');
 
   loadSanctionsList();
+  startNetworkMonitor().catch((err) => {
+    console.warn('[Monitor] Auto-start failed:', err.message);
+  });
 
   app.listen(PORT, () => {
     console.log(`[Server] ArcGuard API running at http://localhost:${PORT}`);

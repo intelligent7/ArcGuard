@@ -6,6 +6,13 @@ import { calculateRiskScore } from '../services/riskEngine.js';
 import { calculateArcScore } from '../services/arcScore.js';
 import { getSanctionsReport, isSanctioned } from '../services/sanctionsCheck.js';
 import { getWalletInfo, getRecentTransactions } from '../services/arcProvider.js';
+import {
+  getNetworkEvents,
+  getNetworkMonitorStatus,
+  pollNetworkOnce,
+  startNetworkMonitor,
+  stopNetworkMonitor,
+} from '../services/networkMonitor.js';
 import { ethers } from 'ethers';
 
 const router = Router();
@@ -89,6 +96,62 @@ router.get('/arc-score/:address', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error('[API] arc-score error:', err);
+    res.status(500).json({ error: 'Internal server error', message: err.message });
+  }
+});
+
+/**
+ * GET /api/v1/monitor/status
+ * Current Network Monitor status
+ */
+router.get('/monitor/status', (req, res) => {
+  res.json(getNetworkMonitorStatus());
+});
+
+/**
+ * GET /api/v1/monitor/events
+ * Recent suspicious network events
+ */
+router.get('/monitor/events', (req, res) => {
+  res.json(getNetworkEvents({
+    limit: req.query.limit,
+    severity: req.query.severity,
+    type: req.query.type,
+  }));
+});
+
+/**
+ * POST /api/v1/monitor/start
+ * Start background polling
+ */
+router.post('/monitor/start', async (req, res) => {
+  try {
+    const status = await startNetworkMonitor(req.body || {});
+    res.json(status);
+  } catch (err) {
+    console.error('[API] monitor start error:', err);
+    res.status(500).json({ error: 'Internal server error', message: err.message });
+  }
+});
+
+/**
+ * POST /api/v1/monitor/stop
+ * Stop background polling
+ */
+router.post('/monitor/stop', (req, res) => {
+  res.json(stopNetworkMonitor());
+});
+
+/**
+ * POST /api/v1/monitor/poll
+ * Force one monitor poll
+ */
+router.post('/monitor/poll', async (req, res) => {
+  try {
+    const status = await pollNetworkOnce();
+    res.json(status);
+  } catch (err) {
+    console.error('[API] monitor poll error:', err);
     res.status(500).json({ error: 'Internal server error', message: err.message });
   }
 });

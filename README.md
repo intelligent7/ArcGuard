@@ -50,6 +50,9 @@ npm run dev
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/v1/risk-score/:address` | Full risk assessment (0-100 score) |
+| `GET` | `/api/v1/arc-score/:address` | Arc-native wallet reputation score |
+| `GET` | `/api/v1/monitor/status` | Network Monitor polling status |
+| `GET` | `/api/v1/monitor/events` | Recent whale, outflow, burst, and spike events |
 | `GET` | `/api/v1/sanctions/:address` | Quick OFAC sanctions check |
 | `GET` | `/api/v1/wallet/:address` | Basic wallet info |
 | `POST` | `/api/v1/screen` | Screen incoming payment (accept/reject/review) |
@@ -58,7 +61,7 @@ npm run dev
 
 ### Example: Screen a Payment
 ```bash
-curl -X POST http://localhost:3001/api/v1/screen \
+curl -X POST http://localhost:3099/api/v1/screen \
   -H "Content-Type: application/json" \
   -d '{"sender": "0x1234...", "amount": 500}'
 ```

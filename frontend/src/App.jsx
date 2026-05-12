@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import './App.css';
 
 const API_URL = 'http://localhost:3099/api/v1';
@@ -10,6 +10,48 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState('scanner');
+  const [monitorData, setMonitorData] = useState(null);
+  const [monitorLoading, setMonitorLoading] = useState(false);
+
+  useEffect(() => {
+    if (activeTab !== 'monitor') {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    async function loadMonitorData() {
+      setMonitorLoading(true);
+      setError(null);
+
+      try {
+        const res = await fetch(`${API_URL}/monitor/events?limit=60`);
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to load monitor events');
+        }
+        if (!cancelled) {
+          setMonitorData(data);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err.message);
+        }
+      } finally {
+        if (!cancelled) {
+          setMonitorLoading(false);
+        }
+      }
+    }
+
+    loadMonitorData();
+    const intervalId = setInterval(loadMonitorData, 10000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [activeTab]);
 
   async function handleAnalyze() {
     if (!address.trim()) {
@@ -50,6 +92,25 @@ function App() {
     }
   }
 
+  async function handleMonitorRefresh() {
+    setMonitorLoading(true);
+    setError(null);
+
+    try {
+      await fetch(`${API_URL}/monitor/poll`, { method: 'POST' });
+      const res = await fetch(`${API_URL}/monitor/events?limit=60`);
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to refresh monitor');
+      }
+      setMonitorData(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setMonitorLoading(false);
+    }
+  }
+
   const title = activeTab === 'arcScore'
     ? 'Check your Arc reputation'
     : activeTab === 'monitor'
@@ -61,7 +122,7 @@ function App() {
   const subtitle = activeTab === 'arcScore'
     ? 'Measure wallet maturity, activity depth, volume, and ecosystem footprint on Arc'
     : activeTab === 'monitor'
-      ? 'Live monitoring is the next module: whales, outflows, and anomaly alerts'
+      ? 'Live block polling, whale transfers, outflows, bursts, and CCTP spike candidates'
       : activeTab === 'api'
         ? 'Use ArcGuard endpoints for AML screening, Arc Score, and payment decisions'
         : 'AML screening, risk scoring, and threat detection for the Arc Network';
@@ -116,7 +177,13 @@ function App() {
 
         {activeTab === 'scanner' && riskResult && <RiskResultPanel result={riskResult} />}
         {activeTab === 'arcScore' && arcScoreResult && <ArcScorePanel result={arcScoreResult} />}
-        {activeTab === 'monitor' && <MonitorPlaceholder />}
+        {activeTab === 'monitor' && (
+          <NetworkMonitorPanel
+            data={monitorData}
+            loading={monitorLoading}
+            onRefresh={handleMonitorRefresh}
+          />
+        )}
         {activeTab === 'api' && <ApiDocsPanel />}
 
         {activeTab === 'scanner' && !riskResult && !loading && !error && <EmptyState mode="scanner" />}
@@ -263,18 +330,108 @@ function SummaryTile({ label, value }) {
   );
 }
 
-function MonitorPlaceholder() {
+function NetworkMonitorPanel({ data, loading, onRefresh }) {
+  const status = data?.status || {};
+  const stats = status.stats || {};
+  const events = data?.events || [];
+  const latestEvents = events.slice(0, 8);
+
   return (
-    <div className="placeholder-panel">
-      <h2>Network Monitor is next</h2>
-      <p>
-        The monitoring module will surface whale moves, massive outflows, CCTP spikes, and suspicious patterns
-        across Arc in a live event feed.
-      </p>
-      <div className="placeholder-list">
-        <div className="placeholder-item">Live feed of suspicious events</div>
-        <div className="placeholder-item">Severity labels and alert routing</div>
-        <div className="placeholder-item">Telegram and webhook delivery</div>
+    <div className="monitor-layout">
+      <div className="monitor-toolbar">
+        <div>
+          <div className="monitor-kicker">Network Monitor</div>
+          <div className="monitor-heading">Arc live feed</div>
+        </div>
+        <button className="secondary-btn" onClick={onRefresh} disabled={loading}>
+          {loading ? 'Refreshing...' : 'Refresh'}
+        </button>
+      </div>
+
+      <div className="monitor-status-grid">
+        <MetricCard label="Status" value={status.running ? 'Running' : 'Stopped'} tone={status.running ? 'good' : 'muted'} />
+        <MetricCard label="Latest block" value={formatNumber(status.latestBlock)} />
+        <MetricCard label="Scanned block" value={formatNumber(status.lastScannedBlock)} />
+        <MetricCard label="Lag" value={status.lagBlocks === null || status.lagBlocks === undefined ? '-' : `${status.lagBlocks} blocks`} />
+        <MetricCard label="Transfers" value={formatNumber(stats.transfersSeen)} />
+        <MetricCard label="Events" value={formatNumber(stats.eventsDetected)} tone={stats.eventsDetected ? 'warn' : 'muted'} />
+      </div>
+
+      <div className="detector-strip">
+        <DetectorPill label="Whale transfers" type="whale_transfer" events={events} />
+        <DetectorPill label="Massive outflows" type="massive_outflow" events={events} />
+        <DetectorPill label="Transfer bursts" type="burst_activity" events={events} />
+        <DetectorPill label="CCTP spikes" type="cctp_spike_candidate" events={events} />
+      </div>
+
+      {status.lastError && <div className="error-banner">Warning: {status.lastError}</div>}
+
+      <div className="event-feed">
+        <div className="feed-header">
+          <span>Recent events</span>
+          <span>{latestEvents.length} visible</span>
+        </div>
+
+        {latestEvents.length === 0 && (
+          <div className="empty-feed">
+            <div className="shield-icon">LIVE</div>
+            <p>No suspicious Arc activity detected in the current monitor window.</p>
+          </div>
+        )}
+
+        {latestEvents.map((event) => (
+          <EventRow key={event.id} event={event} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value, tone = 'default' }) {
+  return (
+    <div className={`metric-card ${tone}`}>
+      <div className="metric-label">{label}</div>
+      <div className="metric-value">{value ?? '-'}</div>
+    </div>
+  );
+}
+
+function DetectorPill({ label, type, events }) {
+  const count = events.filter((event) => event.type === type).length;
+  return (
+    <div className={count ? 'detector-pill active' : 'detector-pill'}>
+      <span>{label}</span>
+      <strong>{count}</strong>
+    </div>
+  );
+}
+
+function EventRow({ event }) {
+  return (
+    <div className={`event-row ${event.severity}`}>
+      <div className="event-main">
+        <div className="event-title-line">
+          <span className={`severity-dot ${event.severity}`}></span>
+          <span className="event-title">{event.title}</span>
+          <span className="event-type">{event.type.replaceAll('_', ' ')}</span>
+        </div>
+        <div className="event-summary">{event.summary}</div>
+        <div className="event-meta">
+          <span>Block {formatNumber(event.blockNumber)}</span>
+          <span>{formatTime(event.timestamp)}</span>
+          {event.txHash && (
+            <a href={`https://testnet.arcscan.app/tx/${event.txHash}`} target="_blank" rel="noreferrer">
+              {shortHash(event.txHash)}
+            </a>
+          )}
+        </div>
+      </div>
+      <div className="event-side">
+        <div className="event-amount">{formatTokenAmount(event.amountUnits, event.amountLabel)}</div>
+        <div className="event-addresses">
+          {event.addresses?.from && <span>from {shortAddress(event.addresses.from)}</span>}
+          {event.addresses?.to && <span>to {shortAddress(event.addresses.to)}</span>}
+        </div>
       </div>
     </div>
   );
@@ -284,6 +441,8 @@ function ApiDocsPanel() {
   const endpoints = [
     ['GET', '/api/v1/risk-score/:address', 'Full AML risk assessment'],
     ['GET', '/api/v1/arc-score/:address', 'Arc-native reputation score'],
+    ['GET', '/api/v1/monitor/events', 'Live Network Monitor event feed'],
+    ['GET', '/api/v1/monitor/status', 'Network Monitor polling status'],
     ['GET', '/api/v1/sanctions/:address', 'Quick sanctions lookup'],
     ['GET', '/api/v1/wallet/:address', 'Wallet info and tx count'],
     ['POST', '/api/v1/screen', 'Decision matrix for incoming payments'],
@@ -370,6 +529,42 @@ function getArcScoreColor(score) {
     return '#FFB300';
   }
   return '#8B9DC3';
+}
+
+function formatNumber(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return '-';
+  }
+  return Number(value).toLocaleString('en-US');
+}
+
+function formatTokenAmount(value, label = 'units') {
+  const number = Number(value) || 0;
+  if (number === 0) {
+    return `0 ${label}`;
+  }
+  return `${number.toLocaleString('en-US', { maximumFractionDigits: 2 })} ${label}`;
+}
+
+function formatTime(timestamp) {
+  if (!timestamp) {
+    return '-';
+  }
+  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function shortAddress(address) {
+  if (!address) {
+    return '';
+  }
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function shortHash(hash) {
+  if (!hash) {
+    return '';
+  }
+  return `${hash.slice(0, 8)}...${hash.slice(-6)}`;
 }
 
 export default App;
